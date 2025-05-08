@@ -1,0 +1,44 @@
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from pydantic import BaseModel
+import asyncio
+from queue import mock_queue
+from utils import store_session, remove_session
+
+app = FastAPI()
+active_connections = {}
+
+class GenesysMessage(BaseModel):
+    to: dict
+    from_: dict
+    text: str
+
+@app.websocket("/ws/{user_id}")
+async def websocket_endpoint(websocket: WebSocket, user_id: str):
+    await websocket.accept()
+    active_connections[user_id] = websocket
+    store_session(user_id)
+    try:
+        while True:
+            await websocket.receive_text()
+    except WebSocketDisconnect:
+        active_connections.pop(user_id, None)
+        remove_session(user_id)
+
+@app.post("/genesys-webhook")
+async def receive_webhook(message: GenesysMessage):
+    mock_queue.enqueue(message.dict())
+    return {"status": "queued"}
+
+@app.on_event("startup")
+async def start_worker():
+    async def worker():
+        while True:
+            msg = mock_queue.dequeue()
+            if msg:
+                user_id = msg["to"]["id"]
+                websocket = active_connections.get(user_id)
+                if websocket:
+                    await websocket.send_json(msg)
+            await asyncio.sleep(1)
+
+    asyncio.create_task(worker())
